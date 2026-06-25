@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video_support"
+version = "0.1.0"
+description = "video_support"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "requests",
+    "srt",
+    "openai",
+    "tqdm",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["video_support*"]
