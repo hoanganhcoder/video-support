@@ -122,3 +122,18 @@ out = translate_srt(
 
 print(out)
 ```
+
+
+### Trans gpt local
+
+``` python
+translate_srt_via_socket(
+        input_srt=args.input_srt,
+        output_srt=args.output_srt,
+        server=args.server,
+        batch_size=args.batch_size,
+        poll_interval=args.poll_interval,
+        job_timeout=args.job_timeout,
+        retry=args.retry,
+    )
+```

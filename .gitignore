@@ -5,3 +5,7 @@ ffprobe.exe
 
 env/
 *.py[odc]
+
+client_secret.json
+test.py
+token.json
