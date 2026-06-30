@@ -40,6 +40,10 @@ def cookies_to_header(cookies):
     return "; ".join(f"{k}={v}" for k, v in cookies.items())
 
 
+def safe_name(name):
+    return re.sub(r'[\\/:*?"<>|]', "_", str(name)).strip()
+
+
 def quality_name(qid):
     return {
         127: "8K",
@@ -126,7 +130,14 @@ def build_headers(bvid):
     }
 
 
-def info(video_url, cookie_path="cookies.txt", target_qid=80):
+def print_pages(info_data):
+    print("========== PAGES ==========")
+    for p in info_data["pages"]:
+        mark = "*" if p["page"] == info_data["page"] else " "
+        print(f"{mark} P{p['page']} | cid={p['cid']} | {p['title']}")
+
+
+def info(video_url, cookie_path="cookies.txt", target_qid=80, page=1):
     cookies = load_cookies_txt(cookie_path)
     bvid = extract_bvid(video_url)
     headers = build_headers(bvid)
@@ -140,7 +151,17 @@ def info(video_url, cookie_path="cookies.txt", target_qid=80):
 
     data = view["data"]
     title = data["title"]
-    cid = data["cid"]
+    pages_raw = data.get("pages") or []
+
+    if not pages_raw:
+        raise RuntimeError("Không lấy được danh sách page")
+
+    if page < 1 or page > len(pages_raw):
+        raise ValueError(f"Page không hợp lệ: {page}. Video này có {len(pages_raw)} page")
+
+    selected_page = pages_raw[page - 1]
+    cid = selected_page["cid"]
+    part = selected_page.get("part") or f"P{page}"
 
     play = request_json(
         "https://api.bilibili.com/x/player/playurl",
@@ -167,15 +188,17 @@ def info(video_url, cookie_path="cookies.txt", target_qid=80):
         raise RuntimeError("Không có audio stream")
 
     video_choices = []
-    for i, v in enumerate(sorted(
-        videos,
-        key=lambda x: (
-            x.get("id", 0) or 0,
-            codec_rank(x.get("codecs")),
-            x.get("bandwidth", 0) or 0,
-        ),
-        reverse=True,
-    )):
+    for i, v in enumerate(
+        sorted(
+            videos,
+            key=lambda x: (
+                x.get("id", 0) or 0,
+                codec_rank(x.get("codecs")),
+                x.get("bandwidth", 0) or 0,
+            ),
+            reverse=True,
+        )
+    ):
         video_choices.append({
             "index": i,
             "id": v.get("id"),
@@ -192,7 +215,9 @@ def info(video_url, cookie_path="cookies.txt", target_qid=80):
         })
 
     audio_choices = []
-    for i, a in enumerate(sorted(audios, key=lambda x: x.get("bandwidth", 0) or 0, reverse=True)):
+    for i, a in enumerate(
+        sorted(audios, key=lambda x: x.get("bandwidth", 0) or 0, reverse=True)
+    ):
         audio_choices.append({
             "index": i,
             "id": a.get("id"),
@@ -209,6 +234,17 @@ def info(video_url, cookie_path="cookies.txt", target_qid=80):
         "bvid": bvid,
         "cid": cid,
         "title": title,
+        "page": page,
+        "part": part,
+        "pages": [
+            {
+                "page": p.get("page"),
+                "cid": p.get("cid"),
+                "title": p.get("part") or f"P{p.get('page')}",
+                "duration": p.get("duration"),
+            }
+            for p in pages_raw
+        ],
         "cookies": cookies,
         "headers": headers,
         "support": play_data.get("accept_description") or [],
@@ -321,6 +357,8 @@ def download(info_data, video_index, output_path, audio_index=0, temp_dir="downl
     if only_audio:
         print("========== SELECTED ==========")
         print("Title       :", info_data["title"])
+        print("Page        :", f"P{info_data['page']}", info_data["part"])
+        print("CID         :", info_data["cid"])
         print("Audio codec :", audio["codec_name"], audio["codec"])
         print("Audio bitrate:", audio["bandwidth"])
         print("Audio file  :", audio["size_text"])
@@ -361,6 +399,8 @@ def download(info_data, video_index, output_path, audio_index=0, temp_dir="downl
 
     print("========== SELECTED ==========")
     print("Title        :", info_data["title"])
+    print("Page         :", f"P{info_data['page']}", info_data["part"])
+    print("CID          :", info_data["cid"])
     print("Video quality:", video["quality"])
     print("Video codec  :", video["codec_name"], video["codec"])
     print("Video size   :", f"{video['width']}x{video['height']}")
