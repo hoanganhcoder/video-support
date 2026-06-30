@@ -297,7 +297,7 @@ def ffprobe_info(file_path):
     return json.loads(result.stdout)
 
 
-def download(info_data, video_index, output_path, audio_index=0, temp_dir="downloads"):
+def download(info_data, video_index, output_path, audio_index=0, temp_dir="downloads", only_audio=False):
     output_path = Path(output_path)
     temp_dir = Path(temp_dir)
 
@@ -317,6 +317,44 @@ def download(info_data, video_index, output_path, audio_index=0, temp_dir="downl
 
     video_tmp = temp_dir / f"{output_path.stem}.video.m4s"
     audio_tmp = temp_dir / f"{output_path.stem}.audio.m4s"
+
+    if only_audio:
+        print("========== SELECTED ==========")
+        print("Title       :", info_data["title"])
+        print("Audio codec :", audio["codec_name"], audio["codec"])
+        print("Audio bitrate:", audio["bandwidth"])
+        print("Audio file  :", audio["size_text"])
+
+        print("\nDownloading audio...")
+        download_any(audio["urls"], audio_tmp, headers, cookies)
+
+        print("\nMerging...")
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-nostats",
+                "-y",
+                "-i", str(audio_tmp),
+                "-c", "copy",
+                str(output_path),
+            ],
+            check=True,
+        )
+
+        audio_tmp.unlink(missing_ok=True)
+
+        print("\nDone:", output_path)
+
+        probe = ffprobe_info(output_path)
+        if probe:
+            fmt = probe.get("format", {})
+            print("Duration:", fmt.get("duration"))
+            print("Size    :", fmt.get("size"))
+            print("Bitrate :", fmt.get("bit_rate"))
+
+        return str(output_path)
 
     video_tmp.unlink(missing_ok=True)
     audio_tmp.unlink(missing_ok=True)
