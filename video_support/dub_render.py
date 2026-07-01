@@ -28,9 +28,9 @@ class DubRenderConfig:
         max_timeline_scale=1.30,
         scale_percentile=0.90,
         dub_sample_rate=24000,
-        block_seconds=900,
-        wav_convert_workers=4,
+        block_seconds=600,
         duration_workers=8,
+        wav_convert_workers=4,
         ffmpeg_threads=4,
         faststart=True,
         normalize_dub=True,
@@ -54,8 +54,8 @@ class DubRenderConfig:
         self.dub_sample_rate = int(dub_sample_rate)
         self.block_seconds = int(block_seconds)
 
-        self.wav_convert_workers = int(wav_convert_workers)
         self.duration_workers = int(duration_workers)
+        self.wav_convert_workers = int(wav_convert_workers)
         self.ffmpeg_threads = str(ffmpeg_threads)
 
         self.faststart = bool(faststart)
@@ -86,10 +86,10 @@ def _run(cmd, check=True):
     print("RETURN CODE:", r.returncode, flush=True)
 
     if r.stdout:
-        print(r.stdout[-1000:], flush=True)
+        print(r.stdout[-800:], flush=True)
 
     if r.stderr:
-        print(r.stderr[-3000:], flush=True)
+        print(r.stderr[-2500:], flush=True)
 
     if check and r.returncode != 0:
         raise RuntimeError("Command failed")
@@ -104,20 +104,6 @@ def _require_file(path):
     if not path.is_file():
         raise ValueError(path)
     return path
-
-
-def _safe_unlink(path):
-    try:
-        Path(path).unlink()
-    except Exception:
-        pass
-
-
-def _clean_dir(path):
-    path = Path(path)
-    if path.exists():
-        shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
 
 
 def _load_json(path, default):
@@ -142,6 +128,20 @@ def _save_json_atomic(path, data):
 def _file_signature(path):
     st = Path(path).stat()
     return f"{st.st_size}:{st.st_mtime_ns}"
+
+
+def _clean_dir(path):
+    path = Path(path)
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_unlink(path):
+    try:
+        Path(path).unlink()
+    except Exception:
+        pass
 
 
 def _ffprobe_duration_seconds(path):
@@ -219,38 +219,47 @@ def _read_srt_entries(path):
     return out
 
 
+def _read_wav_info(path):
+    with wave.open(str(_require_file(path)), "rb") as wf:
+        return {
+            "channels": wf.getnchannels(),
+            "sample_width": wf.getsampwidth(),
+            "sample_rate": wf.getframerate(),
+            "frames": wf.getnframes(),
+        }
+
+
 def _read_pcm16_wav(path):
     with wave.open(str(_require_file(path)), "rb") as wf:
         channels = wf.getnchannels()
-        sampwidth = wf.getsampwidth()
-        rate = wf.getframerate()
+        sample_width = wf.getsampwidth()
+        sample_rate = wf.getframerate()
         frames = wf.getnframes()
 
-        if channels != 1 or sampwidth != 2:
+        if channels != 1 or sample_width != 2:
             raise ValueError(f"Invalid WAV format: {path}")
 
         data = wf.readframes(frames)
 
-    return rate, np.frombuffer(data, dtype=np.int16)
+    return sample_rate, np.frombuffer(data, dtype=np.int16)
 
 
-def _write_pcm16_wav(path, samples, sample_rate):
+def _write_pcm32_wav(path, samples, sample_rate):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    samples = np.asarray(samples)
-    samples = np.clip(samples, -32768, 32767).astype(np.int16)
+    samples = np.asarray(samples, dtype=np.int32)
 
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(1)
-        wf.setsampwidth(2)
+        wf.setsampwidth(4)
         wf.setframerate(int(sample_rate))
         wf.writeframes(samples.tobytes())
 
     return path
 
 
-def _concat_wavs_copy(wav_files, output_path, list_path, config):
+def _concat_wavs_copy(wav_files, output_path, list_path):
     list_path = Path(list_path)
     output_path = Path(output_path)
 
@@ -395,13 +404,13 @@ def compute_timeline_scale(items, config):
 
     report = {
         "timeline_scale": scale,
-        "slow_audio_speed": 1.0 / scale,
-        "final_speedback": scale,
+        "tts_speedup": scale,
         "scale_percentile": config.scale_percentile,
         "min_gap_ms": config.min_gap_ms,
         "max_timeline_scale": config.max_timeline_scale,
         "allowed_overlap_pairs": over_count,
         "total_pairs": len(ratios),
+        "design": "speedup_tts_only_no_slow_timeline",
     }
 
     (config.render_dir / "timeline_scale_report.json").write_text(
@@ -410,19 +419,18 @@ def compute_timeline_scale(items, config):
     )
 
     print("timeline_scale:", scale, flush=True)
-    print("slow_audio_speed:", 1.0 / scale, flush=True)
-    print("final_speedback:", scale, flush=True)
+    print("tts_speedup:", scale, flush=True)
     print("allowed overlap pairs:", over_count, "/", len(ratios), flush=True)
 
     return scale
 
 
-def make_slow_original_audio(rendered_video, scale, config, source_video=None):
+def extract_original_audio(rendered_video, config, source_video=None):
     t0 = _now()
 
     rendered_video = Path(rendered_video)
     source_video = Path(source_video) if source_video else None
-    out_path = config.render_dir / "slow_original_low.wav"
+    out_path = config.render_dir / "original_audio_low.wav"
 
     if _video_has_audio(rendered_video):
         audio_source = rendered_video
@@ -430,8 +438,6 @@ def make_slow_original_audio(rendered_video, scale, config, source_video=None):
         audio_source = source_video
     else:
         audio_source = None
-
-    speed = 1.0 / float(scale)
 
     if audio_source:
         _run([
@@ -441,14 +447,14 @@ def make_slow_original_audio(rendered_video, scale, config, source_video=None):
             "-threads", config.ffmpeg_threads,
             "-i", str(_require_file(audio_source)),
             "-vn",
-            "-af", f"{_atempo_chain(speed)},volume={config.original_volume}",
+            "-af", f"volume={config.original_volume}",
             "-ac", "2",
             "-ar", "44100",
             "-c:a", "pcm_s16le",
             str(out_path),
         ])
     else:
-        total_sec = _ffprobe_duration_seconds(rendered_video) * float(scale)
+        total_sec = _ffprobe_duration_seconds(rendered_video)
 
         _run([
             "ffmpeg", "-y",
@@ -461,17 +467,18 @@ def make_slow_original_audio(rendered_video, scale, config, source_video=None):
             str(out_path),
         ])
 
-    _elapsed("make_slow_original_audio", t0)
+    _elapsed("extract_original_audio", t0)
     return _require_file(out_path)
 
 
-def cache_tts_wavs(items, config):
+def cache_tts_speed_wavs(items, scale, config):
     t0 = _now()
 
-    cache_dir = config.render_dir / "tts_wav_cache"
+    scale_key = f"{float(scale):.6f}".replace(".", "_")
+    cache_dir = config.render_dir / "tts_speed_wav_cache" / f"scale_{scale_key}"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    cache_file = config.render_dir / "tts_wav_cache.json"
+    cache_file = config.render_dir / f"tts_speed_wav_cache_scale_{scale_key}.json"
     cache = _load_json(cache_file, {})
 
     jobs = []
@@ -490,22 +497,24 @@ def cache_tts_wavs(items, config):
         ok = (
             rec
             and rec.get("sig") == sig
+            and abs(float(rec.get("scale", 0)) - float(scale)) < 1e-6
             and rec.get("wav")
             and Path(rec["wav"]).exists()
             and Path(rec["wav"]).stat().st_size > 44
         )
 
         new_item = dict(item)
-        new_item["wav_path"] = wav_path
 
         if ok:
+            info = _read_wav_info(rec["wav"])
             new_item["wav_path"] = Path(rec["wav"])
+            new_item["speed_frames"] = int(info["frames"])
             usable.append(new_item)
         else:
             jobs.append((new_item, key, sig, wav_path))
 
-    print("WAV cache ready:", len(usable), flush=True)
-    print("Need convert mp3->wav:", len(jobs), flush=True)
+    print("Speed WAV cache ready:", len(usable), flush=True)
+    print("Need convert/speed mp3->wav:", len(jobs), flush=True)
 
     def convert_job(new_item, key, sig, wav_path):
         tmp = wav_path.with_suffix(".tmp.wav")
@@ -519,6 +528,7 @@ def cache_tts_wavs(items, config):
                 "-nostdin",
                 "-threads", "1",
                 "-i", str(_require_file(new_item["path"])),
+                "-af", _atempo_chain(scale),
                 "-ac", "1",
                 "-ar", str(config.dub_sample_rate),
                 "-c:a", "pcm_s16le",
@@ -534,7 +544,10 @@ def cache_tts_wavs(items, config):
 
         tmp.replace(wav_path)
 
+        info = _read_wav_info(wav_path)
+
         new_item["wav_path"] = wav_path
+        new_item["speed_frames"] = int(info["frames"])
 
         return new_item, key, sig, wav_path
 
@@ -551,49 +564,42 @@ def cache_tts_wavs(items, config):
                     usable.append(new_item)
                     cache[key] = {
                         "sig": sig,
+                        "scale": float(scale),
                         "wav": str(wav_path),
                     }
                 except Exception as e:
                     failed.append(str(e))
 
                 if n == 1 or n % 50 == 0 or n == len(futures):
-                    print(f"convert wav {n}/{len(futures)}", flush=True)
+                    print(f"convert speed wav {n}/{len(futures)}", flush=True)
 
         _save_json_atomic(cache_file, cache)
 
     if failed:
-        (config.render_dir / "tts_wav_convert_failed.json").write_text(
+        (config.render_dir / "tts_speed_wav_failed.json").write_text(
             json.dumps(failed, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
     usable.sort(key=lambda x: (x["start_ms"], x["index"]))
 
-    print("WAV usable:", len(usable), flush=True)
-    print("WAV failed:", len(failed), flush=True)
-    _elapsed("cache_tts_wavs", t0)
+    print("Speed WAV usable:", len(usable), flush=True)
+    print("Speed WAV failed:", len(failed), flush=True)
+    _elapsed("cache_tts_speed_wavs", t0)
 
     return usable
 
 
-def _item_scaled_range_frames(item, scale, sample_rate):
-    start_ms = int(round(int(item["start_ms"]) * float(scale)))
-    duration_ms = int(item["duration_ms"])
-
-    start_frame = int(round(start_ms * sample_rate / 1000.0))
-    approx_frames = int(math.ceil(duration_ms * sample_rate / 1000.0))
-
-    return start_frame, start_frame + approx_frames
-
-
-def _assign_items_to_blocks(items, scale, total_frames, block_frames, sample_rate):
+def _assign_items_to_blocks(items, total_frames, block_frames, sample_rate):
     block_count = max(1, int(math.ceil(total_frames / block_frames)))
     blocks = [[] for _ in range(block_count)]
 
     for item in items:
-        start_frame, end_frame = _item_scaled_range_frames(item, scale, sample_rate)
+        start_frame = int(round(int(item["start_ms"]) * sample_rate / 1000.0))
+        frames = int(item.get("speed_frames") or 0)
+        end_frame = start_frame + frames
 
-        if end_frame <= 0 or start_frame >= total_frames:
+        if frames <= 0 or end_frame <= 0 or start_frame >= total_frames:
             continue
 
         start_frame = max(0, start_frame)
@@ -609,19 +615,20 @@ def _assign_items_to_blocks(items, scale, total_frames, block_frames, sample_rat
     return blocks
 
 
-def build_dub_wav_block_mix(items, rendered_video, scale, config):
+def build_dub_wav_timeline_original(items, rendered_video, config):
     t0 = _now()
 
     rendered_video = Path(rendered_video)
+
     block_dir = config.render_dir / "dub_blocks"
-    final_dub = config.render_dir / "dub_slow_timeline.wav"
-    raw_dub = config.render_dir / "dub_slow_timeline_raw.wav"
+    raw_dub = config.render_dir / "dub_timeline_raw_s32.wav"
+    final_dub = config.render_dir / "dub_timeline.wav"
     concat_list = config.render_dir / "dub_blocks.txt"
 
     _clean_dir(block_dir)
 
     sample_rate = int(config.dub_sample_rate)
-    total_sec = _ffprobe_duration_seconds(rendered_video) * float(scale)
+    total_sec = _ffprobe_duration_seconds(rendered_video)
     total_frames = int(math.ceil(total_sec * sample_rate))
     block_frames = int(config.block_seconds * sample_rate)
     block_count = max(1, int(math.ceil(total_frames / block_frames)))
@@ -629,12 +636,10 @@ def build_dub_wav_block_mix(items, rendered_video, scale, config):
     print("Dub timeline seconds:", total_sec, flush=True)
     print("Dub timeline frames:", total_frames, flush=True)
     print("Block seconds:", config.block_seconds, flush=True)
-    print("Block frames:", block_frames, flush=True)
     print("Block count:", block_count, flush=True)
 
     blocks = _assign_items_to_blocks(
         items=items,
-        scale=scale,
         total_frames=total_frames,
         block_frames=block_frames,
         sample_rate=sample_rate,
@@ -642,8 +647,8 @@ def build_dub_wav_block_mix(items, rendered_video, scale, config):
 
     block_files = []
     global_peak = 0
-    mixed_count = 0
     failed = []
+    mixed_count = 0
 
     for block_index, block_items in enumerate(blocks):
         block_start_frame = block_index * block_frames
@@ -655,14 +660,10 @@ def build_dub_wav_block_mix(items, rendered_video, scale, config):
         block_path = block_dir / f"block_{block_index:05d}.wav"
         mix = np.zeros(frames_this_block, dtype=np.int32)
 
-        if block_index == 0 or block_index % 5 == 0 or block_index == block_count - 1:
-            print(
-                f"mix block {block_index + 1}/{block_count} "
-                f"items={len(block_items)}",
-                flush=True,
-            )
-
-        seen_in_block = 0
+        print(
+            f"mix block {block_index + 1}/{block_count} items={len(block_items)}",
+            flush=True,
+        )
 
         for item in block_items:
             try:
@@ -671,9 +672,7 @@ def build_dub_wav_block_mix(items, rendered_video, scale, config):
                 if rate != sample_rate:
                     raise ValueError(f"Bad wav sample rate: {rate} != {sample_rate}")
 
-                scaled_start_ms = int(round(int(item["start_ms"]) * float(scale)))
-                target_frame = int(round(scaled_start_ms * sample_rate / 1000.0))
-
+                target_frame = int(round(int(item["start_ms"]) * sample_rate / 1000.0))
                 local_start = target_frame - block_start_frame
                 src_start = 0
 
@@ -692,7 +691,7 @@ def build_dub_wav_block_mix(items, rendered_video, scale, config):
                 src_end = src_start + (local_end - local_start)
 
                 mix[local_start:local_end] += samples[src_start:src_end].astype(np.int32)
-                seen_in_block += 1
+                mixed_count += 1
 
             except Exception as e:
                 failed.append({
@@ -704,18 +703,16 @@ def build_dub_wav_block_mix(items, rendered_video, scale, config):
             peak = int(np.max(np.abs(mix)))
             global_peak = max(global_peak, peak)
 
-        mixed_count += seen_in_block
-
-        _write_pcm16_wav(block_path, mix, sample_rate)
+        _write_pcm32_wav(block_path, mix, sample_rate)
         block_files.append(block_path)
 
     if failed:
-        (config.render_dir / "dub_block_mix_failed.json").write_text(
+        (config.render_dir / "dub_mix_failed.json").write_text(
             json.dumps(failed, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
-    _concat_wavs_copy(block_files, raw_dub, concat_list, config)
+    _concat_wavs_copy(block_files, raw_dub, concat_list)
 
     gain = 1.0
 
@@ -726,38 +723,34 @@ def build_dub_wav_block_mix(items, rendered_video, scale, config):
     print("Dub raw peak:", global_peak, flush=True)
     print("Dub normalize gain:", gain, flush=True)
 
-    if gain != 1.0:
-        _run([
-            "ffmpeg", "-y",
-            "-hide_banner",
-            "-nostdin",
-            "-threads", config.ffmpeg_threads,
-            "-i", str(_require_file(raw_dub)),
-            "-af", f"volume={gain:.8f}",
-            "-ar", str(sample_rate),
-            "-ac", "1",
-            "-c:a", "pcm_s16le",
-            str(final_dub),
-        ])
-    else:
-        shutil.copyfile(raw_dub, final_dub)
+    _run([
+        "ffmpeg", "-y",
+        "-hide_banner",
+        "-nostdin",
+        "-threads", config.ffmpeg_threads,
+        "-i", str(_require_file(raw_dub)),
+        "-af", f"volume={gain:.8f}",
+        "-ar", str(sample_rate),
+        "-ac", "1",
+        "-c:a", "pcm_s16le",
+        str(final_dub),
+    ])
 
     report = {
-        "method": "wav_cache_block_pcm_mix",
+        "method": "tts_speedup_then_block_pcm_mix_on_original_timeline",
         "timeline_seconds": total_sec,
-        "timeline_frames": total_frames,
         "sample_rate": sample_rate,
         "block_seconds": config.block_seconds,
         "block_count": block_count,
-        "mixed_count_block_occurrences": mixed_count,
         "items_count": len(items),
+        "mixed_count_block_occurrences": mixed_count,
         "global_peak_before_normalize": global_peak,
         "normalize_enabled": config.normalize_dub,
         "normalize_gain": gain,
         "failed_count": len(failed),
     }
 
-    (config.render_dir / "dub_block_mix_report.json").write_text(
+    (config.render_dir / "dub_mix_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -765,11 +758,11 @@ def build_dub_wav_block_mix(items, rendered_video, scale, config):
     if not config.keep_blocks:
         shutil.rmtree(block_dir, ignore_errors=True)
 
-    _elapsed("build_dub_wav_block_mix", t0)
+    _elapsed("build_dub_wav", t0)
     return _require_file(final_dub)
 
 
-def mux_final_audio_video(rendered_video, slow_original_audio, dub_wav, output_video, scale, config):
+def mux_final_audio_video(rendered_video, original_audio, dub_wav, output_video, config):
     t0 = _now()
 
     filter_complex = (
@@ -784,7 +777,6 @@ def mux_final_audio_video(rendered_video, slow_original_audio, dub_wav, output_v
 
         "[orig][dub]"
         "amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
-        f"{_atempo_chain(scale)},"
         f"volume={config.final_mix_volume},"
         f"alimiter=limit={config.limiter_limit}[aout]"
     )
@@ -795,7 +787,7 @@ def mux_final_audio_video(rendered_video, slow_original_audio, dub_wav, output_v
         "-nostdin",
         "-threads", config.ffmpeg_threads,
         "-i", str(_require_file(rendered_video)),
-        "-i", str(_require_file(slow_original_audio)),
+        "-i", str(_require_file(original_audio)),
         "-i", str(_require_file(dub_wav)),
         "-filter_complex", filter_complex,
         "-map", "0:v:0",
@@ -840,11 +832,6 @@ def render_dubbed_video(
     print("TTS_DIR:", tts_dir, flush=True)
     print("OUTPUT_VIDEO:", output_video, flush=True)
 
-    print("ORIGINAL_VOLUME:", config.original_volume, flush=True)
-    print("DUB_VOLUME:", config.dub_volume, flush=True)
-    print("FINAL_MIX_VOLUME:", config.final_mix_volume, flush=True)
-    print("DUB_TARGET_PEAK:", config.dub_target_peak, flush=True)
-
     print("MAX_TIMELINE_SCALE:", config.max_timeline_scale, flush=True)
     print("SCALE_PERCENTILE:", config.scale_percentile, flush=True)
     print("BLOCK_SECONDS:", config.block_seconds, flush=True)
@@ -860,28 +847,25 @@ def render_dubbed_video(
 
     scale = compute_timeline_scale(items, config)
 
-    slow_original_audio = make_slow_original_audio(
+    original_audio = extract_original_audio(
         rendered_video=rendered_video,
         source_video=source_video,
-        scale=scale,
         config=config,
     )
 
-    wav_items = cache_tts_wavs(items, config)
+    speed_items = cache_tts_speed_wavs(items, scale, config)
 
-    dub_wav = build_dub_wav_block_mix(
-        items=wav_items,
+    dub_wav = build_dub_wav_timeline_original(
+        items=speed_items,
         rendered_video=rendered_video,
-        scale=scale,
         config=config,
     )
 
     final_video = mux_final_audio_video(
         rendered_video=rendered_video,
-        slow_original_audio=slow_original_audio,
+        original_audio=original_audio,
         dub_wav=dub_wav,
         output_video=output_video,
-        scale=scale,
         config=config,
     )
 
@@ -894,6 +878,6 @@ def render_dubbed_video(
     return {
         "output_video": str(final_video),
         "scale": scale,
+        "original_audio": str(original_audio),
         "dub_wav": str(dub_wav),
-        "slow_original_audio": str(slow_original_audio),
     }
