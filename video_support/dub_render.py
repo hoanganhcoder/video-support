@@ -3,7 +3,6 @@ import subprocess
 import shlex
 import json
 import math
-import os
 import time
 import wave
 import shutil
@@ -33,7 +32,6 @@ class DubRenderConfig:
         ffmpeg_threads=4,
         faststart=True,
         normalize_dub=True,
-        keep_cache=True,
         keep_blocks=False,
     ):
         self.render_dir = Path(render_dir)
@@ -59,7 +57,6 @@ class DubRenderConfig:
 
         self.faststart = bool(faststart)
         self.normalize_dub = bool(normalize_dub)
-        self.keep_cache = bool(keep_cache)
         self.keep_blocks = bool(keep_blocks)
 
 
@@ -241,43 +238,6 @@ def _read_pcm16_wav(path):
         data = wf.readframes(frames)
 
     return sample_rate, np.frombuffer(data, dtype=np.int16)
-
-
-def _write_pcm32_wav(path, samples, sample_rate):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    samples = np.asarray(samples, dtype=np.int32)
-
-    with wave.open(str(path), "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(4)
-        wf.setframerate(int(sample_rate))
-        wf.writeframes(samples.tobytes())
-
-    return path
-
-
-def _concat_wavs_copy(wav_files, output_path, list_path):
-    list_path = Path(list_path)
-    output_path = Path(output_path)
-
-    with list_path.open("w", encoding="utf-8") as f:
-        for p in wav_files:
-            f.write(f"file '{Path(p).resolve().as_posix()}'\n")
-
-    _run([
-        "ffmpeg", "-y",
-        "-hide_banner",
-        "-nostdin",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(list_path),
-        "-c", "copy",
-        str(output_path),
-    ])
-
-    return _require_file(output_path)
 
 
 def collect_tts_items(vi_srt, tts_dir, config):
@@ -517,7 +477,6 @@ def cache_tts_speed_wavs(items, scale, config):
 
     def convert_job(new_item, key, sig, wav_path):
         tmp = wav_path.with_suffix(".tmp.wav")
-
         _safe_unlink(tmp)
 
         r = subprocess.run(
@@ -619,12 +578,8 @@ def build_dub_wav_timeline_original(items, rendered_video, config):
 
     rendered_video = Path(rendered_video)
 
-    block_dir = config.render_dir / "dub_blocks"
     raw_dub = config.render_dir / "dub_timeline_raw_s32.wav"
     final_dub = config.render_dir / "dub_timeline.wav"
-    concat_list = config.render_dir / "dub_blocks.txt"
-
-    _clean_dir(block_dir)
 
     sample_rate = int(config.dub_sample_rate)
     total_sec = _ffprobe_duration_seconds(rendered_video)
@@ -644,74 +599,81 @@ def build_dub_wav_timeline_original(items, rendered_video, config):
         sample_rate=sample_rate,
     )
 
-    block_files = []
     global_peak = 0
     failed = []
     mixed_count = 0
 
-    for block_index, block_items in enumerate(blocks):
-        block_start_frame = block_index * block_frames
-        frames_this_block = min(block_frames, total_frames - block_start_frame)
+    _safe_unlink(raw_dub)
 
-        if frames_this_block <= 0:
-            continue
+    with wave.open(str(raw_dub), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(4)
+        wf.setframerate(sample_rate)
 
-        block_path = block_dir / f"block_{block_index:05d}.wav"
-        mix = np.zeros(frames_this_block, dtype=np.int32)
+        for block_index, block_items in enumerate(blocks):
+            block_start_frame = block_index * block_frames
+            frames_this_block = min(block_frames, total_frames - block_start_frame)
 
-        print(
-            f"mix block {block_index + 1}/{block_count} items={len(block_items)}",
-            flush=True,
-        )
+            if frames_this_block <= 0:
+                continue
 
-        for item in block_items:
-            try:
-                rate, samples = _read_pcm16_wav(item["wav_path"])
+            mix = np.zeros(frames_this_block, dtype=np.int32)
 
-                if rate != sample_rate:
-                    raise ValueError(f"Bad wav sample rate: {rate} != {sample_rate}")
+            print(
+                f"mix block {block_index + 1}/{block_count} "
+                f"time={block_start_frame / sample_rate:.2f}s "
+                f"items={len(block_items)}",
+                flush=True,
+            )
 
-                target_frame = int(round(int(item["start_ms"]) * sample_rate / 1000.0))
-                local_start = target_frame - block_start_frame
-                src_start = 0
+            for item in block_items:
+                try:
+                    rate, samples = _read_pcm16_wav(item["wav_path"])
 
-                if local_start < 0:
-                    src_start = -local_start
-                    local_start = 0
+                    if rate != sample_rate:
+                        raise ValueError(f"Bad wav sample rate: {rate} != {sample_rate}")
 
-                if src_start >= samples.size:
-                    continue
+                    target_frame = int(round(int(item["start_ms"]) * sample_rate / 1000.0))
+                    local_start = target_frame - block_start_frame
+                    src_start = 0
 
-                local_end = min(frames_this_block, local_start + samples.size - src_start)
+                    if local_start < 0:
+                        src_start = -local_start
+                        local_start = 0
 
-                if local_end <= local_start:
-                    continue
+                    if src_start >= samples.size:
+                        continue
 
-                src_end = src_start + (local_end - local_start)
+                    local_end = min(
+                        frames_this_block,
+                        local_start + samples.size - src_start,
+                    )
 
-                mix[local_start:local_end] += samples[src_start:src_end].astype(np.int32)
-                mixed_count += 1
+                    if local_end <= local_start:
+                        continue
 
-            except Exception as e:
-                failed.append({
-                    "index": int(item.get("index", -1)),
-                    "error": str(e),
-                })
+                    src_end = src_start + (local_end - local_start)
 
-        if mix.size:
-            peak = int(np.max(np.abs(mix)))
-            global_peak = max(global_peak, peak)
+                    mix[local_start:local_end] += samples[src_start:src_end].astype(np.int32)
+                    mixed_count += 1
 
-        _write_pcm32_wav(block_path, mix, sample_rate)
-        block_files.append(block_path)
+                except Exception as e:
+                    failed.append({
+                        "index": int(item.get("index", -1)),
+                        "error": str(e),
+                    })
+
+            if mix.size:
+                peak = int(np.max(np.abs(mix)))
+                global_peak = max(global_peak, peak)
+
+            wf.writeframes(mix.astype(np.int32).tobytes())
 
     if failed:
         (config.render_dir / "dub_mix_failed.json").write_text(
             json.dumps(failed, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-
-    _concat_wavs_copy(block_files, raw_dub, concat_list)
 
     gain = 1.0
 
@@ -736,7 +698,7 @@ def build_dub_wav_timeline_original(items, rendered_video, config):
     ])
 
     report = {
-        "method": "tts_speedup_then_block_pcm_mix_on_original_timeline",
+        "method": "single_wav_stream_block_pcm_mix_no_concat",
         "timeline_seconds": total_sec,
         "sample_rate": sample_rate,
         "block_seconds": config.block_seconds,
@@ -753,9 +715,6 @@ def build_dub_wav_timeline_original(items, rendered_video, config):
         json.dumps(report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-
-    if not config.keep_blocks:
-        shutil.rmtree(block_dir, ignore_errors=True)
 
     _elapsed("build_dub_wav", t0)
     return _require_file(final_dub)
