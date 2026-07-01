@@ -1,4 +1,3 @@
-%%writefile dub_render.py
 from pathlib import Path
 import subprocess
 import shlex
