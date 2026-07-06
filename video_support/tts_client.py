@@ -125,7 +125,7 @@ def read_entries(path: str | Path) -> list[Entry]:
 
 
 def audio_path(output_dir: str | Path, idx: int) -> Path:
-    return Path(output_dir) / f"{int(idx):05d}.mp3"
+    return Path(output_dir) / f"{int(idx):05d}.wav"
 
 
 def audio_done(path: str | Path, min_bytes: int) -> bool:
