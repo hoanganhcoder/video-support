@@ -6,7 +6,6 @@ import math
 import time
 import shutil
 import re
-import wave
 
 
 class DubRenderConfig:
@@ -107,14 +106,55 @@ def _clean_dir(path):
 
 
 def _wav_duration_ms(path):
-    with wave.open(str(_require_file(path)), "rb") as wf:
-        frames = wf.getnframes()
-        sample_rate = wf.getframerate()
+    path = _require_file(path)
 
-    if sample_rate <= 0:
-        raise RuntimeError(f"Invalid WAV sample rate: {path}")
+    with path.open("rb") as f:
+        riff = f.read(12)
 
-    return int(math.ceil(frames * 1000.0 / sample_rate))
+        if len(riff) < 12 or riff[0:4] not in (b"RIFF", b"RF64") or riff[8:12] != b"WAVE":
+            raise RuntimeError(f"Not a RIFF/WAVE file: {path}")
+
+        byte_rate = None
+        block_align = None
+        sample_rate = None
+        data_size = None
+
+        while True:
+            header = f.read(8)
+
+            if len(header) < 8:
+                break
+
+            chunk_id = header[0:4]
+            chunk_size = int.from_bytes(header[4:8], "little", signed=False)
+            chunk_start = f.tell()
+
+            if chunk_id == b"fmt ":
+                fmt = f.read(min(chunk_size, 32))
+
+                if len(fmt) < 16:
+                    raise RuntimeError(f"Invalid WAV fmt chunk: {path}")
+
+                sample_rate = int.from_bytes(fmt[4:8], "little", signed=False)
+                byte_rate = int.from_bytes(fmt[8:12], "little", signed=False)
+                block_align = int.from_bytes(fmt[12:14], "little", signed=False)
+            elif chunk_id == b"data":
+                data_size = chunk_size
+                break
+
+            f.seek(chunk_start + chunk_size + (chunk_size % 2))
+
+    if data_size is None:
+        raise RuntimeError(f"WAV has no data chunk: {path}")
+
+    if byte_rate and byte_rate > 0:
+        return int(math.ceil(data_size * 1000.0 / byte_rate))
+
+    if sample_rate and block_align and sample_rate > 0 and block_align > 0:
+        frames = data_size / block_align
+        return int(math.ceil(frames * 1000.0 / sample_rate))
+
+    raise RuntimeError(f"WAV duration is not readable: {path}")
 
 
 def _atempo_chain(speed):
