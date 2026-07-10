@@ -157,6 +157,32 @@ def _wav_duration_ms(path):
     raise RuntimeError(f"WAV duration is not readable: {path}")
 
 
+def _media_duration_ms(path):
+    r = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nw=1:nk=1",
+            str(_require_file(path)),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "").strip() or "ffprobe duration failed")
+
+    return int(math.ceil(float(r.stdout.strip()) * 1000))
+
+
+def _tts_duration_ms(path):
+    try:
+        return _wav_duration_ms(path), "wav_header"
+    except Exception:
+        return _media_duration_ms(path), "ffprobe"
+
+
 def _atempo_chain(speed):
     speed = float(speed)
     parts = []
@@ -242,6 +268,7 @@ def collect_tts_items(vi_srt, tts_dir, config):
     items = []
     missing = []
     failed = []
+    duration_fallback = 0
 
     for entry in _read_srt_entries(vi_srt):
         index = int(entry["index"])
@@ -252,11 +279,16 @@ def collect_tts_items(vi_srt, tts_dir, config):
             continue
 
         try:
-            duration_ms = _wav_duration_ms(wav_path)
+            duration_ms, duration_source = _tts_duration_ms(wav_path)
+
+            if duration_source != "wav_header":
+                duration_fallback += 1
+
             items.append({
                 "index": index,
                 "start_ms": int(entry["start_ms"]),
                 "duration_ms": duration_ms,
+                "duration_source": duration_source,
                 "path": wav_path,
             })
         except Exception as exc:
@@ -268,7 +300,8 @@ def collect_tts_items(vi_srt, tts_dir, config):
 
     print("TTS clips found:", len(items), flush=True)
     print("Missing:", len(missing), flush=True)
-    print("Bad WAV:", len(failed), flush=True)
+    print("Duration fallback ffprobe:", duration_fallback, flush=True)
+    print("Bad TTS:", len(failed), flush=True)
 
     if missing:
         (config.render_dir / "missing_tts_for_dub.json").write_text(
@@ -277,7 +310,7 @@ def collect_tts_items(vi_srt, tts_dir, config):
         )
 
     if failed:
-        (config.render_dir / "bad_tts_wav_for_dub.json").write_text(
+        (config.render_dir / "bad_tts_for_dub.json").write_text(
             json.dumps(failed, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
