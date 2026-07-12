@@ -157,32 +157,6 @@ def _wav_duration_ms(path):
     raise RuntimeError(f"WAV duration is not readable: {path}")
 
 
-def _media_duration_ms(path):
-    r = subprocess.run(
-        [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=nw=1:nk=1",
-            str(_require_file(path)),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    if r.returncode != 0:
-        raise RuntimeError((r.stderr or "").strip() or "ffprobe duration failed")
-
-    return int(math.ceil(float(r.stdout.strip()) * 1000))
-
-
-def _tts_duration_ms(path):
-    try:
-        return _wav_duration_ms(path), "wav_header"
-    except Exception:
-        return _media_duration_ms(path), "ffprobe"
-
-
 def _atempo_chain(speed):
     speed = float(speed)
     parts = []
@@ -268,7 +242,6 @@ def collect_tts_items(vi_srt, tts_dir, config):
     items = []
     missing = []
     failed = []
-    duration_fallback = 0
 
     for entry in _read_srt_entries(vi_srt):
         index = int(entry["index"])
@@ -279,16 +252,11 @@ def collect_tts_items(vi_srt, tts_dir, config):
             continue
 
         try:
-            duration_ms, duration_source = _tts_duration_ms(wav_path)
-
-            if duration_source != "wav_header":
-                duration_fallback += 1
-
+            duration_ms = _wav_duration_ms(wav_path)
             items.append({
                 "index": index,
                 "start_ms": int(entry["start_ms"]),
                 "duration_ms": duration_ms,
-                "duration_source": duration_source,
                 "path": wav_path,
             })
         except Exception as exc:
@@ -300,8 +268,7 @@ def collect_tts_items(vi_srt, tts_dir, config):
 
     print("TTS clips found:", len(items), flush=True)
     print("Missing:", len(missing), flush=True)
-    print("Duration fallback ffprobe:", duration_fallback, flush=True)
-    print("Bad TTS:", len(failed), flush=True)
+    print("Bad WAV:", len(failed), flush=True)
 
     if missing:
         (config.render_dir / "missing_tts_for_dub.json").write_text(
@@ -310,7 +277,7 @@ def collect_tts_items(vi_srt, tts_dir, config):
         )
 
     if failed:
-        (config.render_dir / "bad_tts_for_dub.json").write_text(
+        (config.render_dir / "bad_tts_wav_for_dub.json").write_text(
             json.dumps(failed, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
@@ -546,13 +513,21 @@ def build_dub_wav(items, video_stretch, config):
     return _require_file(final_dub)
 
 
-def mux_final_video(rendered_video, dub_wav, output_video, video_stretch, config, source_video=None):
+def mux_final_video(
+    rendered_video,
+    dub_wav,
+    output_video,
+    video_stretch,
+    config,
+    source_audio=None,
+):
     t0 = _now()
     rendered_video = Path(rendered_video)
-    source_video = Path(source_video) if source_video else None
+    source_audio = Path(source_audio) if source_audio else None
     output_video = Path(output_video)
 
-    audio_source = source_video or rendered_video
+    if source_audio is None:
+        raise ValueError("source_audio is required. Extract source audio once and pass it explicitly.")
 
     cmd = [
         "ffmpeg", "-y",
@@ -561,15 +536,8 @@ def mux_final_video(rendered_video, dub_wav, output_video, video_stretch, config
         "-nostdin",
         "-threads", config.ffmpeg_threads,
         "-i", str(_require_file(rendered_video)),
+        "-i", str(_require_file(source_audio)),
     ]
-
-    if audio_source.resolve() == rendered_video.resolve():
-        orig_label = "0:a"
-        dub_label = "1:a"
-    else:
-        orig_label = "1:a"
-        dub_label = "2:a"
-        cmd += ["-i", str(_require_file(audio_source))]
 
     cmd += ["-i", str(_require_file(dub_wav))]
 
@@ -580,14 +548,14 @@ def mux_final_video(rendered_video, dub_wav, output_video, video_stretch, config
         filters.append(f"[0:v]setpts={video_stretch:.8f}*PTS[vout]")
 
     filters.append(
-        f"[{orig_label}]"
+        "[1:a]"
         f"volume={config.original_volume},"
         f"{_atempo_chain(audio_speed)},"
         "aresample=44100,"
         "aformat=sample_fmts=fltp:channel_layouts=stereo[orig]"
     )
     filters.append(
-        f"[{dub_label}]"
+        "[2:a]"
         f"volume={config.dub_volume},"
         "aresample=44100,"
         "aformat=sample_fmts=fltp:channel_layouts=stereo[dub]"
@@ -636,7 +604,7 @@ def render_dubbed_video(
     vi_srt,
     tts_dir,
     output_video,
-    source_video=None,
+    source_audio=None,
     config=None,
 ):
     config = config or DubRenderConfig()
@@ -646,10 +614,10 @@ def render_dubbed_video(
     vi_srt = Path(vi_srt)
     tts_dir = Path(tts_dir)
     output_video = Path(output_video)
-    source_video = Path(source_video) if source_video else None
+    source_audio = Path(source_audio) if source_audio else None
 
     print("RENDERED_VIDEO:", rendered_video, flush=True)
-    print("SOURCE_VIDEO:", source_video, flush=True)
+    print("SOURCE_AUDIO:", source_audio, flush=True)
     print("VI_SRT:", vi_srt, flush=True)
     print("TTS_DIR:", tts_dir, flush=True)
     print("OUTPUT_VIDEO:", output_video, flush=True)
@@ -677,7 +645,7 @@ def render_dubbed_video(
         output_video=output_video,
         video_stretch=video_stretch,
         config=config,
-        source_video=source_video,
+        source_audio=source_audio,
     )
 
     print("DONE:", final_video, flush=True)
