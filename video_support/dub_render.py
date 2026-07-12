@@ -105,6 +105,24 @@ def _clean_dir(path):
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _media_duration_ms(path):
+    r = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nw=1:nk=1",
+            str(_require_file(path)),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "").strip() or "ffprobe duration failed")
+
+    return int(math.ceil(float(r.stdout.strip()) * 1000))
+
 def _wav_duration_ms(path):
     path = _require_file(path)
 
@@ -252,7 +270,7 @@ def collect_tts_items(vi_srt, tts_dir, config):
             continue
 
         try:
-            duration_ms = _wav_duration_ms(wav_path)
+            duration_ms = _media_duration_ms(wav_path)
             items.append({
                 "index": index,
                 "start_ms": int(entry["start_ms"]),
